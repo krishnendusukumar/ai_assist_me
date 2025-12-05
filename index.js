@@ -2,16 +2,18 @@ require("dotenv").config();
 const fs = require("fs");
 const { execFile } = require("child_process");
 const { File } = require("node:buffer");
-globalThis.File = File;  // Node 18 ke liye File polyfill
+globalThis.File = File;
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const twilio = require("twilio");
 const OpenAI = require("openai");
-const { Language } = require("twilio/lib/twiml/VoiceResponse");
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -23,80 +25,75 @@ const client = twilio(
 
 const NGROK_BASE_URL = process.env.NGROK_BASE_URL; // e.g. https://abcd.ngrok-free.app
 
-
-let lastAnswer = "";
+// ========== MEMORY FOR LATEST ANSWER ==========
 let lastTranscript = "";
+let lastFullAnswer = "";
+let lastSummary = "";
 
-function saveLatestAnswer({ transcript, answer, body }) {
-  // Jo chaho store karo – main 3 cheezen rakh raha hoon
+function saveLatestAnswer({ transcript, full_answer, summary }) {
   lastTranscript = transcript || "";
-  lastAnswer = answer || "";
+  lastFullAnswer = full_answer || "";
+  lastSummary = summary || "";
+  console.log("💾 Saved latest answer + summary");
 }
 
-
+// ========== SYSTEM PROMPT ==========
 const MEDICAL_SYSTEM_PROMPT = `
-You are a cautious AI health helper called "Sehat Button".
+You are "Sehat Assist" — a personal AI voice assistant designed to make the user’s life easier in every possible way. 
+You are speaking to ONE user only (the device owner).
 
-GOALS
-- Give simple, practical health guidance in short, clear Hinglish.
-- Always use Latin script only (no Devanagari, Urdu, etc.).
-- Sound calm, polite, and supportive.
+-------------------------
+PRIMARY GOALS
+-------------------------
+- Make the user's life easier instantly, without asking unnecessary questions.
+- Understand context quickly: health, tasks, reminders, planning, thinking, motivation, personal decisions.
+- Give actionable steps, not vague talk.
+- Always reply in simple, clear Hinglish (Latin script only).
+- Provide BOTH:
+  1) Full detailed answer (for WhatsApp)
+  2) Short 1–3 line summary (for small wearable screen)
 
-STYLE
-- Reply in 3–5 short sentences.
-- Use very simple words and short lines so elder people can read easily.
-- Prefer bullet-style or line-breaks instead of long paragraphs.
-- Do NOT use emojis unless the user uses them first.
+-------------------------
+WHAT YOU MUST AVOID
+-------------------------
+- You are NOT a doctor or lawyer — do not claim to be.
+- No exact medicine names, no dosages.
+- No diagnostics or high-risk instructions.
 
-SAFETY & LIMITS (VERY IMPORTANT)
-- You are NOT a doctor. Do NOT say or imply that you are a doctor.
-- Do NOT prescribe exact medicines, brand names, or dosages.
-- You may mention general categories only (e.g. "painkiller", "antacid", "ORS").
-- Do NOT give instructions for injections, IV drips, or any medical procedures.
-- For chest pain, breathing problems, confusion, severe bleeding, loss of consciousness, or stroke symptoms:
-  - Immediately say it may be an EMERGENCY.
-  - Tell them to go to the nearest hospital or call local emergency services.
-- If symptoms are serious, long-lasting, or unclear:
-  - Clearly say that a real doctor visit is needed.
+-------------------------
+RESPONSE FORMAT (VERY IMPORTANT)
+-------------------------
+You MUST always return your output in JSON with EXACT keys:
 
-UNKNOWN / LOW CONFIDENCE
-- If you are not sure, say "Mujhe exact problem clear nahi hai" and recommend seeing a doctor.
-- Never guess dangerous advice just to give an answer.
+{
+  "full_answer": "<long, helpful, detailed explanation here>",
+  "summary": "<1–3 line condensed summary for OLED screen>"
+}
 
-ENDING LINE (ALWAYS)
-- Always end with ONE disclaimer line in Hinglish, e.g.:
-  "Ye sirf general health info hai, proper diagnosis ke liye zaroor doctor se milo."
+full_answer max ~10 lines, clear Hinglish, friendly.
+summary max 3 short lines, very clear.
 `;
 
-
-
-function formatWhatsAppMessage({ transcript, answer }) {
-  const trimmedTranscript = (transcript || "").trim();
-  const trimmedAnswer = (answer || "").trim();
+// ========== WHATSAPP MESSAGE FORMAT ==========
+function formatWhatsAppMessage({ transcript, full_answer }) {
+  const t = (transcript || "").trim();
+  const a = (full_answer || "").trim();
 
   return [
-    "*🩺 Sehat Button – AI Health Helper*",
+    "*🎧 Sehat Assist – AI Helper*",
     "",
-    trimmedTranscript
-      ? `_*Aapka sawal (voice se):*_ \n${trimmedTranscript}`
+    t
+      ? `_*Aapka sawal (voice se):*_ \n${t}`
       : "_*Aapka sawal clear nahi mila (audio low / noise).*_",
     "",
-    "*Sugges­tion:*",
-    trimmedAnswer,
+    "*Jawab:*",
+    a,
     "",
-    "_Note: Ye sirf general health info hai. Koi bhi serious ya lambi problem ho to turant doctor se milo ya nearest hospital jao._",
+    "_Note: Ye general guidance hai. Serious ya lambi problem ho to turant doctor ya expert se milo._",
   ].join("\n");
 }
 
-
-
-function escapeXml(str) {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
+// ========== AUDIO CONVERSION ==========
 function convertUlawToWav(ulawPath, wavPath) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -110,6 +107,7 @@ function convertUlawToWav(ulawPath, wavPath) {
   });
 }
 
+// ========== MAIN AUDIO PIPELINE ==========
 async function processCallAudio(streamSid, rawBuffer) {
   try {
     if (!rawBuffer || !rawBuffer.length) {
@@ -140,7 +138,7 @@ async function processCallAudio(streamSid, rawBuffer) {
       console.log("⚠️ No speech detected or STT empty, sending 'not clear' message.");
       const fallbackBody = formatWhatsAppMessage({
         transcript: "",
-        answer:
+        full_answer:
           "Mujhe aapki baat clear nahi sunai di (audio low / noise). Kripya thoda zor se, shant jagah me phir se try karo.",
       });
 
@@ -161,13 +159,31 @@ async function processCallAudio(streamSid, rawBuffer) {
       ],
     });
 
-    const answer = completion.choices[0].message.content.trim();
-    console.log(`🤖 AI answer [${streamSid}]:`, answer);
+    const raw = completion.choices[0].message.content.trim();
+    console.log(`🤖 Raw AI answer [${streamSid}]:`, raw);
 
-    
-    
-    const body = formatWhatsAppMessage({ transcript, answer });
-    saveLatestAnswer({ transcript, answer, body });
+    let full_answer = "";
+    let summary = "";
+
+    try {
+      const parsed = JSON.parse(raw);
+      full_answer = (parsed.full_answer || "").trim();
+      summary = (parsed.summary || "").trim();
+    } catch (e) {
+      console.warn("⚠️ AI did not return valid JSON, falling back to raw text.");
+      full_answer = raw;
+      summary =
+        raw.length > 120 ? raw.slice(0, 120) + "..." : raw;
+    }
+
+    console.log("✅ Parsed full_answer:", full_answer);
+    console.log("✅ Parsed summary:", summary);
+
+    // Save for ESP32 /latest-answer
+    saveLatestAnswer({ transcript, full_answer, summary });
+
+    // Send full answer to WhatsApp
+    const body = formatWhatsAppMessage({ transcript, full_answer });
 
     const message = await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_FROM,
@@ -175,16 +191,15 @@ async function processCallAudio(streamSid, rawBuffer) {
       body,
     });
 
-    console.log("WhatsApp Message SID:", message.sid);
+    console.log("📲 WhatsApp Message SID:", message);
   } catch (err) {
     console.error("Error in processCallAudio:", err);
-    // Optional: send a fallback error message to WhatsApp
     try {
       await client.messages.create({
         from: process.env.TWILIO_WHATSAPP_FROM,
         to: process.env.MY_WHATSAPP_NUMBER,
         body:
-          "Sehat Button me kuch technical error aa gaya hai. Thodi der baad phir se try karein. Agar emergency ho to turant doctor ya hospital se contact karein.",
+          "Sehat Assist me kuch technical error aa gaya hai. Thodi der baad phir se try karein. Agar emergency ho to turant doctor ya hospital se contact karein.",
       });
     } catch (e2) {
       console.error("Also failed to send error WhatsApp message:", e2);
@@ -192,17 +207,13 @@ async function processCallAudio(streamSid, rawBuffer) {
   }
 }
 
+// ========== ROUTES ==========
 
-
-
-
-
-// Simple test route
 app.get("/", (req, res) => {
   res.send("Backend is alive");
 });
 
-// 🔘 ESP32 button route
+// ESP32 button -> start call
 app.post("/button", async (req, res) => {
   console.log("Button pressed from ESP32:", req.body);
 
@@ -210,7 +221,6 @@ app.post("/button", async (req, res) => {
     const call = await client.calls.create({
       to: process.env.MY_PHONE_NUMBER,
       from: process.env.TWILIO_FROM_NUMBER,
-      // Twilio yahan se poochega: call pe kya karna hai?
       url: `${NGROK_BASE_URL}/voice`,
     });
 
@@ -222,13 +232,12 @@ app.post("/button", async (req, res) => {
   }
 });
 
-// 📞 Twilio -> yahan TwiML milega (stream start karne ke liye)
+// TwiML for Twilio voice -> start media stream
 app.post("/voice", (req, res) => {
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
 
   const wsUrl = NGROK_BASE_URL.replace("https://", "wss://") + "/media";
-
   twiml.start().stream({ url: wsUrl });
 
   twiml.say(
@@ -236,25 +245,23 @@ app.post("/voice", (req, res) => {
   );
   twiml.pause({ length: 1 });
   twiml.say("Beep.");
-
-  // 🔴 Call ko 60 second tak open rakho taaki tum bol sako
   twiml.pause({ length: 60 });
 
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
+// ESP32 polls this for latest summary
 app.get("/latest-answer", (req, res) => {
   res.json({
     transcript: lastTranscript,
-    answer: lastAnswer,
+    full_answer: lastFullAnswer,
+    summary: lastSummary,
   });
 });
 
-// streamSid -> [base64 audio chunks]
+// ========== WEBSOCKET MEDIA STREAM ==========
 const streams = new Map();
-
-// 🎧 WebSocket server for media stream
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/media" });
 
@@ -274,22 +281,20 @@ wss.on("connection", (ws, req) => {
           chunks.push(data.media.payload); // base64 string
         }
       } else if (data.event === "stop") {
-  console.log("🔴 Stream stopped:", data.streamSid);
+        console.log("🔴 Stream stopped:", data.streamSid);
 
-  const chunks = streams.get(data.streamSid) || [];
-  streams.delete(data.streamSid);
+        const chunks = streams.get(data.streamSid) || [];
+        streams.delete(data.streamSid);
 
-  if (chunks.length > 0) {
-    const raw = Buffer.concat(
-      chunks.map((b64) => Buffer.from(b64, "base64"))
-    );
-
-    // Ab async pipeline chalayenge:
-    processCallAudio(data.streamSid, raw);
-  } else {
-    console.log("No audio chunks collected for this stream.");
-  }
-}
+        if (chunks.length > 0) {
+          const raw = Buffer.concat(
+            chunks.map((b64) => Buffer.from(b64, "base64"))
+          );
+          processCallAudio(data.streamSid, raw);
+        } else {
+          console.log("No audio chunks collected for this stream.");
+        }
+      }
     } catch (e) {
       console.error("Error parsing WS message:", e);
     }
